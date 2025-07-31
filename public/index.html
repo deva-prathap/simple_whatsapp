@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Loan Reminder</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.1/build/qrcode.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>WhatsApp Loan Reminder</h1>
+        
+        <div class="qr-section">
+            <h2>Connect WhatsApp</h2>
+            <div class="qr-container">
+                <canvas id="qrCanvas"></canvas>
+                <p id="qrStatus">Initializing WhatsApp connection...</p>
+            </div>
+            <div id="authStatus"></div>
+        </div>
+
+        <div class="loan-section">
+            <h2>Add New Loan</h2>
+            <form id="loanForm">
+                <div class="form-group">
+                    <label for="companyName">Company Name</label>
+                    <input type="text" id="companyName" required>
+                </div>
+                <div class="form-group">
+                    <label for="loanAmount">Amount (₹)</label>
+                    <input type="number" id="loanAmount" required>
+                </div>
+                <div class="form-group">
+                    <label for="dueDate">Due Date</label>
+                    <input type="date" id="dueDate" required>
+                </div>
+                <button type="submit">Add Loan</button>
+            </form>
+        </div>
+
+        <div class="loan-list">
+            <h2>Your Loans</h2>
+            <table id="loansTable">
+                <thead>
+                    <tr>
+                        <th>Company</th>
+                        <th>Amount</th>
+                        <th>Due Date</th>
+                        <th>Days Left</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // DOM Elements
+        const qrCanvas = document.getElementById('qrCanvas');
+        const qrStatusElement = document.getElementById('qrStatus');
+        const authStatusElement = document.getElementById('authStatus');
+        const loanForm = document.getElementById('loanForm');
+        const loansTableBody = document.querySelector('#loansTable tbody');
+
+        // WebSocket Connection
+        const socket = new WebSocket(`ws://${window.location.host}/whatsapp`);
+
+        socket.onopen = () => {
+            qrStatusElement.textContent = 'Connecting to WhatsApp...';
+        };
+
+        socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            
+            if (data.type === 'qr') {
+                const ctx = qrCanvas.getContext('2d');
+                ctx.clearRect(0, 0, qrCanvas.width, qrCanvas.height);
+                qrStatusElement.textContent = 'Scan this QR code with WhatsApp:';
+                
+                QRCode.toCanvas(qrCanvas, data.data, { 
+                    width: 200,
+                    margin: 2,
+                    color: { dark: '#000000', light: '#ffffff' }
+                }, (error) => {
+                    if (error) console.error('QR error:', error);
+                });
+            }
+            else if (data.type === 'authenticated') {
+                qrCanvas.style.display = 'none';
+                qrStatusElement.textContent = 'Authenticating...';
+                authStatusElement.textContent = '✅ WhatsApp authenticated!';
+                authStatusElement.style.color = 'green';
+            }
+            else if (data.type === 'ready') {
+                qrStatusElement.textContent = '✅ WhatsApp connected!';
+                authStatusElement.textContent = 'Reminders will be sent automatically 2 days before due dates.';
+                loadLoans();
+            }
+            else if (data.type === 'error') {
+                qrStatusElement.textContent = `Error: ${data.message}`;
+                qrStatusElement.style.color = 'red';
+            }
+        };
+
+        // Loan Form Submission
+        loanForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const loan = {
+                company_name: document.getElementById('companyName').value.trim(),
+                loan_amount: parseFloat(document.getElementById('loanAmount').value),
+                due_date: document.getElementById('dueDate').value
+            };
+            
+            try {
+                const response = await fetch('/api/loans', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(loan)
+                });
+                
+                if (response.ok) {
+                    alert('Loan added successfully!');
+                    loanForm.reset();
+                    loadLoans();
+                } else {
+                    throw new Error(await response.text());
+                }
+            } catch (error) {
+                alert('Failed to add loan: ' + error.message);
+            }
+        });
+
+        // Load Loans with Reminder Buttons
+        async function loadLoans() {
+            try {
+                const response = await fetch('/api/loans');
+                const loans = await response.json();
+                loansTableBody.innerHTML = '';
+                
+                loans.forEach(loan => {
+                    const row = document.createElement('tr');
+                    const dueDate = new Date(loan.due_date);
+                    const daysLeft = Math.ceil((dueDate - new Date()) / (1000 * 60 * 60 * 24));
+                    
+                    row.innerHTML = `
+                        <td>${escapeHtml(loan.company_name)}</td>
+                        <td>₹${loan.loan_amount.toLocaleString('en-IN')}</td>
+                        <td>${dueDate.toLocaleDateString('en-IN')}</td>
+                        <td class="${daysLeft < 0 ? 'overdue' : daysLeft <= 2 ? 'warning' : ''}">
+                            ${daysLeft < 0 ? 'Overdue' : daysLeft}
+                        </td>
+                        <td>
+                            <button class="delete-btn" data-id="${loan.id}">Delete</button>
+                            <button class="remind-btn" data-id="${loan.id}">Send Reminder</button>
+                        </td>
+                    `;
+                    loansTableBody.appendChild(row);
+                });
+
+                // Add event listeners
+                document.querySelectorAll('.delete-btn').forEach(btn => {
+                    btn.addEventListener('click', deleteLoan);
+                });
+                document.querySelectorAll('.remind-btn').forEach(btn => {
+                    btn.addEventListener('click', sendManualReminder);
+                });
+
+            } catch (error) {
+                loansTableBody.innerHTML = `
+                    <tr>
+                        <td colspan="5" class="error">Error loading loans: ${escapeHtml(error.message)}</td>
+                    </tr>
+                `;
+            }
+        }
+
+        // Delete Loan
+        async function deleteLoan(e) {
+            const loanId = e.target.getAttribute('data-id');
+            if (confirm('Delete this loan?')) {
+                try {
+                    const response = await fetch(`/api/loans/${loanId}`, { method: 'DELETE' });
+                    if (response.ok) loadLoans();
+                    else throw new Error('Delete failed');
+                } catch (error) {
+                    alert('Failed to delete: ' + error.message);
+                }
+            }
+        }
+
+        // Manual Reminder
+        async function sendManualReminder(e) {
+            const loanId = e.target.getAttribute('data-id');
+            try {
+                const response = await fetch(`/api/loans/${loanId}/remind`, { method: 'POST' });
+                if (response.ok) {
+                    alert('Reminder sent via WhatsApp!');
+                } else {
+                    throw new Error('Reminder failed');
+                }
+            } catch (error) {
+                alert('Failed to send reminder: ' + error.message);
+            }
+        }
+
+        // Helper: Escape HTML
+        function escapeHtml(unsafe) {
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Initial load
+        loadLoans();
+    </script>
+</body>
+</html>
